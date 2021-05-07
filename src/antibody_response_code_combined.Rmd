@@ -1,0 +1,484 @@
+---
+title: "Antibody responses to the BNT162b2 mRNA vaccine in individuals previously infected with SARS-CoV-2"
+author: Min Wu, Nancy Sun
+output: html_notebook
+---
+
+```{r packages, echo=F}
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(tableone)
+```
+
+Valid antibody results at each visit:
+•	Baseline: before vaccination or up to 3 days after vaccine dose #1
+•	After Dose 1: 7-21 days after dose 1
+•	After Dose 2: 7-21 days after dose 2
+
+History of COVID criteria:
+•	IgG N >= 1.4 at baseline or
+•	Self-reported prior COVID or
+•	Confirmed COVID positive PCR test in EHR (date precedes vaccine #1 date)
+•	If self-reported prior COVID & IgG N < 1.4 at baseline & no positive PCR test in electronic health records, clinician reviewed medical charts for COVID history
+
+Substantial Symptoms criteria:
+•	Moderate to severe in degree and lasting <2 days, or
+•	Of any severity and lasting >2 days
+
+
+## Table 1: Characteristics of the Study Cohort
+
+```{r table 1}
+# Reformatting data for tables ------------------------------------------------
+
+# by visit table
+tab_dat <- antibody_df %>% # numeric antibody results for all antibody tests
+  pivot_wider(names_from = test, values_from = value) %>%
+  left_join(vac_dates, by="cs_mrn") %>% # dates of vaccination of survey participants
+  left_join(survey_few, by="cs_mrn") %>% # survey responses of variables of interest
+  # only including antibody results within timeframe specified above
+  mutate(days1 = as.numeric(difftime(draw, as.Date(vac1), units = "days")),
+         days2 = as.numeric(difftime(draw, as.Date(vac2), units = "days")),
+         valid = case_when(
+           visit == "Vaccine Dose 1"  & days1 < 3 ~ TRUE,
+           visit == "Vaccine Dose 2" & days1 >= 7 & days1 <= 21 ~ TRUE,
+           visit == "Post Vaccine 2 week" & days2 >= 7 & days2 <= 21 ~ TRUE,
+           TRUE ~ FALSE
+           )) %>%
+  filter(valid) %>%
+  select(-c(numvisit,draw,vac1,vac2,valid,days1,days2)) %>%
+  # Readjustment of prior COVID based on criteria above
+  mutate(had_covid = ifelse(cs_mrn %in% covid_pos_mrn$cs_mrn, "Yes", had_covid), # IgG N >= 1.4 at baseline or confirmed COVID positive PCR test
+         had_covid = ifelse(cs_mrn %in% covid_reinfection$cs_mrn, "No", had_covid), # Covid after vaccine #1 date
+         had_covid = ifelse(cs_mrn %in% no_covid_chartreviewed, "No", had_covid), # Chart reviewed patients for COVID history
+         had_covid = replace_na(had_covid,"No")) %>%
+  distinct()
+  
+
+# overall table (collapsing visits)
+all_tab_dat <- tab_dat %>%
+  group_by(cs_mrn) %>%
+  mutate(`Architect IgG Index (S/C)` = mean(`Architect IgG Index (S/C)`),
+         `Architect IgM Index (S/C)` = mean(`Architect IgM Index (S/C)`),
+         `Architect Quant IgG II (AU/mL)` = mean(`Architect Quant IgG II (AU/mL)`)) %>%
+  ungroup() %>%
+  select(-visit) %>%
+  distinct()
+
+
+# Creating and joining tables --------------------------------
+
+# variables for table
+vars <- colnames(tab_dat)[-c(1,2)]
+
+# demographic table broken down by visits (pre-vax, post-vax1, post-vax2)
+sp_demo <- CreateTableOne(vars = vars, 
+                          strata = "visit", 
+                          tab_dat, 
+                          includeNA = T)
+
+# overall demographic table
+all_demo <- CreateTableOne(vars = vars, 
+                           data = all_tab_dat, 
+                           includeNA = T)
+
+# putting it all together and formatting
+all_demo %>%
+  print(format = "fp", explain = F, varLabels = T, test = T, missing = F, quote = F, noSpaces = T, printToggle = F) %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column() %>%
+  mutate(rowname = str_replace(rowname, " = TRUE", "")) %>%
+  cbind(sp_demo %>%
+          print(format = "fp", explain = F, varLabels = T, test = T, missing = F, quote = F, noSpaces = T, printToggle = F) %>%
+          as_tibble(rownames = NA) %>%
+          rownames_to_column() %>%
+          mutate(rowname = str_replace(rowname, " = TRUE", "")) %>%
+          select(-rowname))
+```
+
+
+## Data Formatting
+```{r}
+analysis_df <- byvisit_df %>%
+  mutate(
+    # create binary antibody result variables using threshold given by Abbott
+    # Architect IgG Index (S/C)
+    igg_n_pos = case_when(
+      igg_n >= 1.4 ~ "Positive",
+      igg_n < 1.4 ~ "Negative"
+    ),
+    # Architect IgM Index (S/C)
+    igm_s_pos = case_when(
+      igm_s >= 1.00 ~ "Positive",
+      igm_s < 1.00 ~ "Negative"
+    ),
+    # Architect Quant IgG II (AU/mL)
+    igg_s_pos = case_when(
+      igg_s >= 50 ~ "Positive",
+      igg_s < 50 ~ "Negative"
+    ),
+    # Architect Quant IgG II (AU/mL) - neutralizing antibody equivalent level >= 4160 AU/mL
+    igg_s_neutral = case_when(
+      igg_s >= 4160 ~ ">= 4160 AU/mL",
+      igg_s < 4160 ~ "< 4160 AU/mL"
+    ),
+    # ACE2 Binding (%) 50%
+    ace_50 = ace >= 50,
+    # (natural) log transform antibody results due to skewed distribution
+    log_igg_n = log(igg_n), 
+    log_igm_s = log(igm_s),
+    log_igg_s = log(igg_s),
+    # determine prior COVID status 
+    reported_covid = (srv_health_covid_suspect.factor %in% c("Yes, I have had a positive test", "Yes, medical diagnosis but no test") & is.na(covid_dt)) | (!is.na(covid_dt) & covid_dt < dose_1), 
+    # clinician adjudicated no history of COVID
+    adj_no_covid = cs_mrn %in% c("598", "1080", "1354", "1425", "1567", "1621", "1705", "1748"),
+    had_covid = replace_na(!adj_no_covid & (reported_covid | igg_n_1 >= 1.40), F),
+    had_covid = factor(if_else(
+      had_covid, "Prior COVID-19 infection", "No prior COVID-19 infection"
+    )),
+    # calculate duration between blood draw & vaccines
+    days_vac1 = as.numeric(difftime(draw, dose_1, units = "days")),
+    days_vac2 = as.numeric(difftime(draw, dose_2, units = "days")),
+    # only include antibody results within the time frame specified above
+    valid = case_when(
+      visit == "1"  & days_vac1 < 3 ~ TRUE,
+      visit == "2" & days_vac1 >= 7 & days_vac1 <= 21 ~ TRUE,
+      visit == "3a" & days_vac2 >= 7 & days_vac2 <= 21 ~ TRUE,
+      TRUE ~ FALSE
+    ),
+    visit_name = case_when(
+      visit == "1" ~ "Baseline",
+      visit == "2" ~ "After Dose 1",
+      visit == "3a" ~ "After Dose 2"
+    ),
+    visit_name = factor(visit_name, ordered=T, levels=c("Baseline", "After Dose 1", "After Dose 2")),
+    across(c("igg_n_pos", "igm_s_pos", "igg_s_pos", "igg_s_neutral", "ace_50"), factor)
+  ) %>%
+  filter(valid)
+```
+
+## Sensitivity analysis: Participants with 3 valid blood draws
+```{r}
+all3v_df <- analysis_df %>%
+  group_by(cs_mrn) %>%
+  filter(any(visit == "3a") & any(visit == "1") & any(visit == "2")) 
+```
+
+## Participants COVID+ after vaccine 1
+```{r}
+new_covid_df <- analysis_df %>%
+  filter(!had_covid) %>%
+  mutate(new_covid = !is.na(covid_dt) & covid_dt > dose_1) 
+```
+
+## Table S1: Comparison of antibody levels between participants with and without prior COVID-19 infection at matched time points
+```{r}
+s1_v1 <- analysis_df %>%
+  filter(visit == "1") %>%
+  CreateTableOne(vars = c("log_igg_s", "log_igg_n", "log_igm_s", "ace"), strata = "had_covid", data = ., addOverall = F) %>%
+  print(nonnormal= c("log_igg_s", "log_igg_n", "log_igm_s", "ace"), showAllLevels = F, format = "fp", varLabels = T, dropEqual = T, catDigits = 0, contDigits = 1, pDigits = 3, explain = F, test = T, missing = F, quote = F, noSpaces = T, printToggle=F) %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column() 
+
+s1_v2 <- analysis_df %>%
+  filter(visit == "2") %>%
+  CreateTableOne(vars = c("log_igg_s", "log_igg_n", "log_igm_s", "ace"), strata = "had_covid", data = ., addOverall = F) %>%
+  print(nonnormal= c("log_igg_s", "log_igg_n", "log_igm_s", "ace"), showAllLevels = F, format = "fp", varLabels = T, dropEqual = T, catDigits = 0, contDigits = 1, pDigits = 3, explain = F, test = T, missing = F, quote = F, noSpaces = T, printToggle=F) %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column() 
+
+s1_v3a <- analysis_df %>%
+  filter(visit == "3a") %>%
+  CreateTableOne(vars = c("log_igg_s", "log_igg_n", "log_igm_s", "ace"), strata = "had_covid", data = ., addOverall = F) %>%
+  print(nonnormal= c("log_igg_s", "log_igg_n", "log_igm_s", "ace"), showAllLevels = F, format = "fp", varLabels = T, dropEqual = T, catDigits = 0, contDigits = 1, pDigits = 3, explain = F, test = T, missing = F, quote = F, noSpaces = T, printToggle=F) %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column() 
+
+tab_s1 <- bind_rows(s1_v1, s1_v2, s1_v3a) 
+```
+
+## Table S2: Comparison of antibody levels between participants with and without prior COVID-19 infection at shifted time points
+•	prior covid baseline vs. no covid after dose 1
+•	prior covid after dose 1 vs. no covid after dose 2
+```{r}
+shifted_timept <- analysis_df %>%
+  mutate(
+    dose1_levels = case_when(
+      had_covid & visit == 1 ~ 1,
+      !had_covid & visit == 2 ~ 2),
+    dose2_levels = case_when(
+      had_covid & visit == 2 ~ 1,
+      !had_covid & visit == "3a" ~ 2,
+    )
+  )
+
+dose1 <- shifted_timept %>%
+  filter(!is.na(dose1_levels))%>%
+  CreateTableOne(vars = c("log_igg_s", "log_igg_n", "log_igm_s", "ace"), strata = "dose1_levels", data = ., addOverall = F) %>%
+  print(nonnormal= c("log_igg_s", "log_igg_n", "log_igm_s", "ace"), showAllLevels = F, format = "fp", varLabels = T, dropEqual = T, catDigits = 0, contDigits = 1, pDigits = 3, explain = F, test = T, missing = F, quote = F, noSpaces = T, printToggle=F) %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column() 
+
+dose2 <- shifted_timept %>%
+  filter(!is.na(dose2_levels))%>%
+  CreateTableOne(vars = c("log_igg_s", "log_igg_n", "log_igm_s", "ace"), strata = "dose2_levels", data = ., addOverall = F) %>%
+  print(nonnormal= c("log_igg_s", "log_igg_n", "log_igm_s", "ace"), showAllLevels = F, format = "fp", varLabels = T, dropEqual = T, catDigits = 0, contDigits = 1, pDigits = 3, explain = F, test = T, missing = F, quote = F, noSpaces = T, printToggle=F) %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column() 
+
+tab_s2 <- bind_rows(dose1, dose2)
+```
+
+## Table S3: Sensitivity analysis comparing antibody levels between participants with and without prior COVID-19 infection at matched time points
+Participants with all 3 visits (baseline, after dose 1 & after dose 2)
+```{r}
+s3_v1 <- all3v_df %>%
+  filter(visit == "1") %>%
+  CreateTableOne(vars = c("log_igg_s", "log_igg_n", "log_igm_s", "ace"), strata = "had_covid", data = ., addOverall = F) %>%
+  print(nonnormal= c("log_igg_s", "log_igg_n", "log_igm_s", "ace"), showAllLevels = F, format = "fp", varLabels = T, dropEqual = T, catDigits = 0, contDigits = 1, pDigits = 3, explain = F, test = T, missing = F, quote = F, noSpaces = T, printToggle=F) %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column() 
+
+s3_v2 <- all3v_df %>%
+  filter(visit == "2") %>%
+  CreateTableOne(vars = c("log_igg_s", "log_igg_n", "log_igm_s", "ace"), strata = "had_covid", data = ., addOverall = F) %>%
+  print(nonnormal= c("log_igg_s", "log_igg_n", "log_igm_s", "ace"), showAllLevels = F, format = "fp", varLabels = T, dropEqual = T, catDigits = 0, contDigits = 1, pDigits = 3, explain = F, test = T, missing = F, quote = F, noSpaces = T, printToggle=F) %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column() 
+
+s3_v3a <- all3v_df %>%
+  filter(visit == "3a") %>%
+  CreateTableOne(vars = c("log_igg_s", "log_igg_n", "log_igm_s", "ace"), strata = "had_covid", data = ., addOverall = F) %>%
+  print(nonnormal= c("log_igg_s", "log_igg_n", "log_igm_s", "ace"), showAllLevels = F, format = "fp", varLabels = T, dropEqual = T, catDigits = 0, contDigits = 1, pDigits = 3, explain = F, test = T, missing = F, quote = F, noSpaces = T, printToggle=F) %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column() 
+
+tab_s3 <- bind_rows(s3_v1, s3_v2, s3_v3a) 
+```
+
+## Table S4: Sensitivity analysis comparing antibody levels between participants with and without prior COVID-19 infection at shifted time points
+Participants with all 3 visits (baseline, after dose 1 & after dose 2)
+```{r}
+shifted_timept_3v <- all3v_df %>%
+  mutate(
+    dose1_levels = case_when(
+      had_covid & visit == 1 ~ 1,
+      !had_covid & visit == 2 ~ 2),
+    dose2_levels = case_when(
+      had_covid & visit == 2 ~ 1,
+      !had_covid & visit == "3a" ~ 2,
+    )
+  )
+
+dose1_3v <- shifted_timept_3v %>%
+  filter(!is.na(dose1_levels))%>%
+  CreateTableOne(vars = c("log_igg_s", "log_igg_n", "log_igm_s", "ace"), strata = "dose1_levels", data = ., addOverall = F) %>%
+  print(nonnormal= c("log_igg_s", "log_igg_n", "log_igm_s", "ace"), showAllLevels = F, format = "fp", varLabels = T, dropEqual = T, catDigits = 0, contDigits = 1, pDigits = 3, explain = F, test = T, missing = F, quote = F, noSpaces = T, printToggle=F) %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column() 
+
+dose2_3v <- shifted_timept_3v %>%
+  filter(!is.na(dose2_levels))%>%
+  CreateTableOne(vars = c("log_igg_s", "log_igg_n", "log_igm_s", "ace"), strata = "dose2_levels", data = ., addOverall = F) %>%
+  print(nonnormal= c("log_igg_s", "log_igg_n", "log_igm_s", "ace"), showAllLevels = F, format = "fp", varLabels = T, dropEqual = T, catDigits = 0, contDigits = 1, pDigits = 3, explain = F, test = T, missing = F, quote = F, noSpaces = T, printToggle=F) %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column() 
+
+tab_s4 <- bind_rows(dose1_3v, dose2_3v)
+```
+
+## Table S5: Comparison of proportions (%) of Anti-Spike Receptor Binding Domain IgG antibody levels >= 4160 AU/mL between participants with and without prior COVID-19 infection
+```{r}
+s5_v1 <- analysis_df %>%
+  filter(visit == "1") %>%
+  CreateTableOne(vars = "igg_s_neutral", strata = "had_covid", data = ., addOverall = F) %>%
+  print(nonnormal= igg_s_neutral, showAllLevels = F, format = "fp", varLabels = T, dropEqual = T, catDigits = 1, contDigits = 1, pDigits = 3, explain = F, test = T, missing = F, quote = F, noSpaces = T, printToggle=F) %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column() 
+
+s5_v2 <- analysis_df %>%
+  filter(visit == "2") %>%
+  CreateTableOne(vars = "igg_s_neutral", strata = "had_covid", data = ., addOverall = F) %>%
+  print(nonnormal= igg_s_neutral, showAllLevels = F, format = "fp", varLabels = T, dropEqual = T, catDigits = 1, contDigits = 1, pDigits = 3, explain = F, test = T, missing = F, quote = F, noSpaces = T, printToggle=F) %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column() 
+
+s5_v3a <- analysis_df %>%
+  filter(visit == "3a") %>%
+  CreateTableOne(vars = "igg_s_neutral", strata = "had_covid", data = ., addOverall = F) %>%
+  print(nonnormal= igg_s_neutral, showAllLevels = F, format = "fp", varLabels = T, dropEqual = T, catDigits = 1, contDigits = 1, pDigits = 3, explain = F, test = T, missing = F, quote = F, noSpaces = T, printToggle=F) %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column() 
+
+tab_s5 <- bind_rows(s5_v1, s5_v2, s5_v3a) 
+```
+
+## Table S6. Comparison of proportions (%) of ACE2 binding >=50% between participants with and without prior COVID-19 infection
+```{r}
+s6_v2 <- analysis_df %>%
+  filter(visit == "2") %>%
+  CreateTableOne(vars = "ace_50", strata = "had_covid", data = ., addOverall = F) %>%
+  print(nonnormal= ace_50, showAllLevels = F, format = "fp", varLabels = T, dropEqual = T, catDigits = 1, contDigits = 1, pDigits = 3, explain = F, test = T, missing = F, quote = F, noSpaces = T, printToggle=F) %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column() 
+
+s6_v3a <- analysis_df %>%
+  filter(visit == "3a") %>%
+  CreateTableOne(vars = "ace_50", strata = "had_covid", data = ., addOverall = F) %>%
+  print(nonnormal= ace_50, showAllLevels = F, format = "fp", varLabels = T, dropEqual = T, catDigits = 1, contDigits = 1, pDigits = 3, explain = F, test = T, missing = F, quote = F, noSpaces = T, printToggle=F) %>%
+  as_tibble(rownames = NA) %>%
+  rownames_to_column() 
+
+tab_s6 <- bind_rows(s6_v2, s6_v3a) 
+```
+
+## Symptoms data
+```{r symptoms data}
+# Reformatting and adjusting symptom responses
+symp_tab <- symptoms_dat %>%
+  filter(Symptom != "injection_site") %>%
+  # symptoms if they had moderate/sev <2 days or any symptoms after 2 days
+  mutate(anysymp = ifelse( Severity %in% c("Moderate","Severe+") |
+                           Timing %in% c("<= 1 week", "> 1 week"),
+                          "1","0"),
+         symp = anysymp) %>%
+  group_by(cs_mrn, visit) %>%
+  mutate(anysymp=max(anysymp)) %>%
+  ungroup() %>%
+  select(-Timing, -Severity) %>%
+  distinct() %>%
+  pivot_wider(names_from = Symptom, values_from = symp) %>%
+  mutate_at(-c(1,2,3), ~fct_recode(.,"Yes"="1", "No"="0")) %>%
+  # including label of covid history
+  left_join(tab_dat %>% select(cs_mrn, had_covid), by="cs_mrn") %>%
+  # adding group label for comparison later...
+  mutate(group = case_when(visit=="Vaccine Dose 1" & had_covid=="Yes" ~ "covid_v1",
+                           visit=="Vaccine Dose 2" & had_covid=="No"  ~ "nocovid_v2"))
+```
+
+## Table S7: Significant post-vaccine symptoms by SARS-CoV-2 infection status following dose 1 and dose 2 of mRNA vaccine
+```{r}
+CreateTableOne(vars="anysymp", strata = "had_covid", subset(symp_tab,visit=="Vaccine Dose 1"), includeNA = F) 
+CreateTableOne(vars="anysymp", strata = "had_covid", subset(symp_tab,visit=="Vaccine Dose 2"), includeNA = F) 
+```
+
+## Table S8: Significant post-vaccine symptoms following first and second mRNA vaccine doses by SARS-CoV-2 infection status
+```{r}
+CreateTableOne(vars="anysymp",
+               strata = "group", 
+               subset(symp_tab,!is.na(group)), 
+               includeNA = F) %>% 
+  print(format = "fp", explain = F, varLabels = T, test = T, missing = F, quote = F, noSpaces = T, printToggle = F) %>%
+  as.tibble(rownames=NA) %>%
+  rownames_to_column()
+```
+
+## Table S9: Significant post-vaccine symptoms by dose (first and second) of mRNA vaccine stratified by prior SARS-CoV-2 infection status
+```{r}
+# Chi-sq tests ------------
+CreateTableOne(vars="anysymp", strata = "visit", subset(symp_tab,had_covid=="No"), includeNA = F) 
+CreateTableOne(vars="anysymp", strata = "visit", subset(symp_tab,had_covid=="Yes"), includeNA = F) 
+
+# Mcnemar Chi-sq tests --------
+symp_tab %>% filter(had_covid=="No") %>%
+  select(cs_mrn, visit, anysymp) %>%
+  pivot_wider(names_from = visit, values_from = anysymp) %>%
+  select(-cs_mrn) %>%
+  mutate(`Vaccine Dose 1` = ifelse(`Vaccine Dose 1`==0, "no symp", "symp"),
+         `Vaccine Dose 2` = ifelse(`Vaccine Dose 2`==0, "no symp", "symp")) %>%
+  table %>%
+  mcnemar.test()
+
+symp_tab %>% filter(had_covid=="Yes") %>%
+  select(cs_mrn, visit, anysymp) %>%
+  pivot_wider(names_from = visit, values_from = anysymp) %>%
+  select(-cs_mrn) %>%
+  mutate(`Vaccine Dose 1` = ifelse(`Vaccine Dose 1`==0, "no symp", "symp"),
+         `Vaccine Dose 2` = ifelse(`Vaccine Dose 2`==0, "no symp", "symp")) %>%
+  table %>%
+  mcnemar.test()
+```
+
+## Table S10: Types of symptoms reported following vaccine dose 1, by prior SARS-CoV-2 infection status
+```{r}
+CreateTableOne(vars = colnames(symp_tab)[-c(1,2,3,15,16)], 
+               strata = "had_covid", 
+               subset(symp_tab,visit=="Vaccine Dose 1"), 
+               includeNA = F) %>% 
+  print(format = "fp", explain = F, varLabels = T, test = T, missing = F, quote = F, noSpaces = T, printToggle = F) %>%
+  as.tibble(rownames=NA) %>%
+  rownames_to_column()
+```
+
+## Table S11: Types of symptoms reported following vaccine dose 2, by prior SARS-CoV-2 infection status. 
+```{r}
+CreateTableOne(vars = colnames(symp_tab)[-c(1,2,3,15,16)], 
+               strata = "had_covid", 
+               subset(symp_tab,visit=="Vaccine Dose 2"), 
+               includeNA = F) %>% 
+  print(format = "fp", explain = F, varLabels = T, test = T, missing = F, quote = F, noSpaces = T, printToggle = F) %>%
+  as.tibble(rownames=NA) %>%
+  rownames_to_column()
+```
+
+## Figure 1: IgG(S-RBd) antibody response to mRNA SARS-CoV-2 vaccination in individuals with and without prior SARS-CoV-2 infection
+```{r}
+fig_igg_s_covid <- analysis_df %>%
+  filter(!is.na(had_covid)) %>%
+  ggplot(aes(x=visit_name, y = log_igg_s, color = had_covid)) + 
+  scale_color_manual(values = c("#1b7837", "#762a83")) +
+  geom_boxplot(outlier.colour = NA, position = position_dodge(width=0.9)) + 
+  geom_point(position=position_jitterdodge(dodge.width=0.9)) +
+  theme_bw(base_size = 18) + 
+  labs(
+    x="Visit",
+    y="ln(Architect Quant IgG II AU/mL)",
+    colour="Had COVID"
+  ) + 
+  scale_y_continuous(breaks = seq(-6, 14, by=2), limits = c(-6, 14))
+```
+
+## Figure S1: Anti-Nucleocapsid Protein IgG Antibody Response to mRNA SARS-CoV-2 Vaccination in Persons With and Without Prior COVID-19 Infection
+```{r}
+fig_igg_n_covid <- analysis_df %>%
+  filter(!is.na(had_covid)) %>%
+  ggplot(aes(x=visit_name, y = log_igg_n, color = had_covid)) + 
+  scale_color_manual(values = c("#1b7837", "#762a83")) +
+  geom_boxplot(outlier.colour = NA, position = position_dodge(width=0.9)) + 
+  geom_point(position=position_jitterdodge(dodge.width=0.9)) +
+  theme_bw(base_size = 18) + 
+  labs(colour='had_covid') + 
+  ylab("ln(Architect IgG Index S/C)") +
+  xlab("Visit") +
+  scale_y_continuous(breaks = seq(-5, 3, by=2), limits = c(-5, 3))
+```
+
+## Figure S2: Anti-Spike Receptor Binding Domain IgG Antibody Response to mRNA SARS-CoV-2 Vaccination in Persons With and Without Prior COVID-19 Infection: Values Above and Below 4160 AU/mL
+```{r}
+fig_igg_s_neutral <- analysis_df %>%
+  filter(!is.na(had_covid)) %>%
+  ggplot(aes(x=visit_name, y = log_igg_s)) + 
+  geom_boxplot(outlier.size = 0.1) + 
+  geom_jitter(aes(color = fct_rev(igg_s_neutral)), position=position_jitter(0.1)) +
+  theme_bw(base_size = 14) + 
+  facet_wrap(~had_covid) +
+  labs(color='Status') + 
+  ylab("ln(Architect Quant IgG II AU/mL)") + 
+  xlab("Visit")
+```
+
+## Figure S3: ACE2 Antibody Binding Capacity in Persons With and Without Prior COVID-19 Infection: Values Above and Below 50%
+```{r}
+fig_ace_50 <- analysis_df %>%
+  filter(!is.na(ace) & !is.na(had_covid) & visit %in% c("2", "3a")) %>%
+  ggplot(aes(x=visit_name, y = ace)) + 
+  geom_boxplot(outlier.size = 0.1) + 
+  geom_jitter(aes(color = fct_rev(ace_50)), position=position_jitter(0.1)) +
+  theme_bw(base_size = 14) + 
+  facet_wrap(~had_covid) +
+  labs(color='Status') + 
+  ylab("ACE2 Binding (%)") + 
+  xlab("Visit")
+```
+
